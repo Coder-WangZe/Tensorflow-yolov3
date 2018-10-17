@@ -1,4 +1,3 @@
-# image classification
-multiple inputs；
-CNN；
-for fault detection based on the vibration signal
+# object detection
+yolov3；
+implement in tensorflow
