@@ -1,13 +1,10 @@
-import tensorflow as tf
 import os
-import numpy as np
 import colorsys
-from PIL import ImageFont, ImageDraw
-# path = os.path.abspath(__file__)
-# parent_path = os.path.split(path)[0]
-# os.chdir(parent_path + "\\")
-from tf_yolov3.yolo3_model_tf import *
-from tf_yolov3.utils import letterbox_image
+from PIL import Image, ImageFont, ImageDraw
+from timeit import default_timer as timer
+
+from model.yolo3_model_tf import *
+from model.utils import letterbox_image
 
 
 class YOLO(object):
@@ -20,8 +17,8 @@ class YOLO(object):
         }
         self.anchors = self.get_anchors()
         self.vehicle_class_names = self.get_vehicle_class()
-        self.iou = 0.5
-        self.score = 0.5
+        self.iou = 0.1
+        self.score = 0.1
         self.input_image_size = (416, 416)
         self.test_batch = 1
         self.num_anchors = len(self.anchors)
@@ -54,29 +51,28 @@ class YOLO(object):
         x, y1 = make_lastlayer(x1, 512, num_anchors * (num_classes + 5))
 
         x = conv2d(x, 256, (1, 1), strides=[1, 1])
-        x = upsample2d(x)
-        x = tf.concat([x, x1])
+        x = upsample2d(x, 2, 2)
+        x = tf.concat([x, x2], -1)
         x, y2 = make_lastlayer(x, 256, num_anchors * (num_classes + 5))
 
         x = conv2d(x, 128, (1, 1), strides=[1, 1])
-        x = upsample2d(x)
-        x = tf.concat([x, x2])
+        x = upsample2d(x, 2, 2)
+        x = tf.concat([x, x3], -1)
         x, y3 = make_lastlayer(x, 128, num_anchors * (num_classes + 5))
 
-        yolo_outputs = [y1, y2, y3]
-        return yolo_outputs
+        return [y1, y2, y3]
 
     def yolo_evaluate(self, yolo_outputs, anchors, num_classes,
                       image_shape, max_boxes=20, score_threshold=0.6, iou_threshold=0.4):
         num_layers = len(yolo_outputs)
         anchors_mask = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]
-        input_shape = tf.shape(yolo_outputs[1:3]) * 32
+        input_shape = tf.shape(yolo_outputs[0])[1:3] * 32
         boxes = []
         box_scores = []
         # three feature map of different scale to detect
         for i in range(num_layers):
-            anchors = anchors[anchors_mask[i]]
-            _box, _box_score = yolo_boxes_and_scores(yolo_outputs[i], anchors, num_classes, input_shape, image_shape)
+            anchor = anchors[anchors_mask[i]]
+            _box, _box_score = yolo_boxes_and_scores(yolo_outputs[i], anchor, num_classes, input_shape, image_shape)
             boxes.append(_box)
             box_scores.append(_box_score)
         boxes = tf.concat(boxes, axis=0)  # shape:[n, 4]
@@ -113,11 +109,12 @@ class YOLO(object):
 
     def make_input_placeholders(self):
         # define input placeholder
-        inputs_data = tf.placeholder([self.test_batch, 416, 416, 3])
-        inputs_image_size = tf.placeholder([2, ])
+        inputs_data = tf.placeholder(tf.float32, [self.test_batch, 416, 416, 3])
+        inputs_image_size = tf.placeholder(tf.int8, [2, ])
         return inputs_data, inputs_image_size
 
-    def detect_image(self, image):
+    def detect_image(self, image, print_box_in_image=True):
+        start = timer()
         boxed_image = letterbox_image(image, tuple(reversed(self.input_image_size)))
         image_data = np.array(boxed_image, dtype='float32')
         image_data /= 255.
@@ -126,19 +123,82 @@ class YOLO(object):
 
         inputs_data, inputs_image_size = self.make_input_placeholders()
         boxes_, scores_, classes_ = self.yolo_model(inputs_data, inputs_image_size)
+        self.sess.run(tf.global_variables_initializer())
         out_boxes, out_scores, out_classes = \
             self.sess.run([boxes_, scores_, classes_],
                           feed_dict={inputs_data: image_data, inputs_image_size: image_size})
-        return out_boxes, out_scores, out_classes
+        if print_box_in_image:
+            self.draw_objects_in_image(image, out_boxes, out_scores, out_classes)
+            end = timer()
+            print("cost time:  ", round((end - start), 2), 's')
+            return image
+        else:
+            return out_boxes, out_scores, out_classes
+
+    def draw_objects_in_image(self, image, out_boxes, out_scores, out_classes):
+
+        # Generate colors for drawing bounding boxes.
+        hsv_tuples = [(x / len(self.vehicle_class_names), 1., 1.)
+                      for x in range(len(self.vehicle_class_names))]
+        self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
+        self.colors = list(
+            map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)),
+                self.colors))
+        np.random.seed(10101)  # Fixed seed for consistent colors across runs.
+        np.random.shuffle(self.colors)  # Shuffle colors to decorrelate adjacent classes.
+        np.random.seed(None)  # Reset seed to default.
+
+        # draw the box, score and class in the image
+        otf = 'font/FiraMono-Medium.otf'
+        try:
+            font = ImageFont.truetype(font=otf,
+                                      size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
+        except:
+            otf = 'C:/ProgramData/Anaconda3/Lib/site-packages/notebook/static/components/font-awesome/' \
+                  'fonts/FontAwesome.otf'
+            font = ImageFont.truetype(font=otf,
+                                      size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
+
+        thickness = (image.size[0] + image.size[1]) // 300
+
+        for i, c in reversed(list(enumerate(out_classes))):
+            predicted_class = self.vehicle_class_names[c]
+            box = out_boxes[i]
+            score = out_scores[i]
+
+            label = '{} {:.2f}'.format(predicted_class, score)
+            draw = ImageDraw.Draw(image)
+            label_size = draw.textsize(label, font)
+
+            top, left, bottom, right = box
+            top = max(0, np.floor(top + 0.5).astype('int32'))
+            left = max(0, np.floor(left + 0.5).astype('int32'))
+            bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
+            right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
+            print(label, (left, top), (right, bottom))
+
+            if top - label_size[1] >= 0:
+                text_origin = np.array([left, top - label_size[1]])
+            else:
+                text_origin = np.array([left, top + 1])
+
+            # My kingdom for a good redistributable image drawing library.
+            for i in range(thickness):
+                draw.rectangle(
+                    [left + i, top + i, right - i, bottom - i],
+                    outline=self.colors[c])
+            draw.rectangle(
+                [tuple(text_origin), tuple(text_origin + label_size)],
+                fill=self.colors[c])
+            draw.text(text_origin, label, fill=(0, 0, 0), font=font)
+            del draw
+
+    def close_setion(self):
+        self.sess.close()
 
 
-
-
-
-
-
-
-
-
-
-
+yolo3 = YOLO()
+image = Image.open('2.png')
+r_image = yolo3.detect_image(image)
+yolo3.close_setion()
+r_image.show()
